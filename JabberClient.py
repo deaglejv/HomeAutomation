@@ -1,22 +1,39 @@
 #!/usr/bin/env python
 
 import ssl
-import logging
 import pickle
-from getpass import getpass
-from argparse import ArgumentParser
+
 from sleekxmpp import ClientXMPP
-from sleekxmpp.exceptions import IqError, IqTimeout
+
 from sleekxmpp.xmlstream import resolver, cert
 import pika
-from AutomationMessage import AutomationMessage
 
-credentials = pika.PlainCredentials('Someone', 'A Password')
-connection = pika.BlockingConnection(pika.ConnectionParameters(host='192.168.1.x', credentials=credentials))
+from Utils.CmdLineArguments import GetCmdLineArguments
+from Utils.ParseJabberMessage import ParseJabberMessage
+
+# This is going to get used a lot throughout the scripts I suspect.
+args = GetCmdLineArguments()
+
+credentials = pika.PlainCredentials(args.rabbitUser, args.rabbitPassword)
+connection = pika.BlockingConnection(pika.ConnectionParameters(host=args.rabbitURL, credentials=credentials))
 channel = connection.channel()
 
-channel.queue_declare(queue='SendMessage')
-channel.queue_declare(queue='ActionNeeded')
+channel.exchange_declare(exchange='topic_logging', type='direct')
+channel.exchange_declare(exchange='topic_send_message', type='direct')
+channel.exchange_declare(exchange='topic_garage_action', type='direct')
+
+loggingQueue = channel.queue_declare(exclusive=True)
+logging_queue_name = loggingQueue.method.queue
+
+sendMessageQueue = channel.queue_declare(exclusive=True)
+send_message_queue_name = sendMessageQueue.method.queue
+
+garageActionQueue = channel.queue_declare(exclusive=True)
+garage_Action_queue_name = garageActionQueue.method.queue
+
+channel.queue_bind(exchange='topic_logging', queue=logging_queue_name, routing_key='Logging')
+channel.queue_bind(exchange='topic_send_message', queue=send_message_queue_name, routing_key='SendMessage')
+channel.queue_bind(exchange='topic_garage_action', queue=garage_Action_queue_name, routing_key='GarageAction')
 
 class JabberClient(ClientXMPP):
     """
@@ -27,11 +44,6 @@ class JabberClient(ClientXMPP):
 
         self.google_server = google_server
         self.google_port = google_port
-
-        self.logger = logging.getLogger(__name__)
-        log_fmt = '%(asctime)-15s %(levelname)-8s %(message)s'
-        log_level = logging.INFO
-        logging.basicConfig(format=log_fmt, level=log_level)
 
         # The session_start event will be triggered when
         # the bot establishes its connection with the server
@@ -55,6 +67,10 @@ class JabberClient(ClientXMPP):
         self.connect((google_server, google_port))
         self.process(block=False)
 
+        channel.basic_publish(exchange='topic_logging',
+                                  routing_key='Logging',
+                                  body="Server Connected Successfully")
+
     def ssl_invalid_cert(self, raw_cert):
         """
             Handle an invalid certificate from the Jabber server
@@ -73,12 +89,15 @@ class JabberClient(ClientXMPP):
         if domain_uses_google:
             try:
                 if cert.verify('talk.google.com', ssl.PEM_cert_to_DER_cert(raw_cert)):
-                    logging.debug('Google certificate found for %s', self.boundjid.server)
+                    channel.basic_publish(exchange='topic_logging',
+                                          routing_key='Logging',
+                                          body='Google certificate found for %s' % self.boundjid.server)
                     return
             except cert.CertificateError:
                 pass
-
-        logging.error("Invalid certificate received for %s", self.boundjid.server)
+        channel.basic_publish(exchange='topic_logging',
+                                  routing_key='Logging',
+                                  body="Invalid certificate received for %s" % self.boundjid.server)
         self.disconnect()
 
     def start(self, event):
@@ -86,15 +105,7 @@ class JabberClient(ClientXMPP):
             Process the session_start event.
         """
         self.send_presence()
-        try:
-            self.get_roster()
-        except IqError as err:
-            logging.error('There was an error getting the roster')
-            logging.error(err.iq['error']['condition'])
-            self.disconnect()
-        except IqTimeout:
-            logging.error('Server is taking too long to respond')
-            self.disconnect()
+        self.get_roster()
 
     def receive_msg(self, msg):
         """
@@ -109,62 +120,39 @@ class JabberClient(ClientXMPP):
                    how it may be used.
         """
 
-        actionWords = ['open', 'close']
+        msgRouting = ParseJabberMessage(msg)
+        amsg = pickle.loads(msgRouting['body'])
 
         if msg['type'] in ('chat', 'normal'):
-            if  any(x in msg['body'].lower() for x in actionWords):
-                channel.basic_publish(exchange='',
-                      routing_key='ActionNeeded',
-                      body=pickle.dumps(AutomationMessage(msg['from'].bare,msg['body'])))
-            else:
-                channel.basic_publish(exchange='',
+            if msgRouting != None:
+                channel.basic_publish(exchange='topic_send_message',
                       routing_key='SendMessage',
-                      body=pickle.dumps(AutomationMessage(msg['from'].bare,msg['body'])))
+                      body=msgRouting['body'])
 
-
+                channel.basic_publish(exchange='topic_logging',
+                      routing_key='Logging',
+                      body="Message Received From: %s, To: %s, Action: %s, Body: %s" % (amsg.msgFrom
+                                                                                          , amsg.msgTo
+                                                                                          , amsg.msgAction
+                                                                                          , amsg.msgBody))
 def main():
-    parser = ArgumentParser(description=JabberClient.__doc__)
-
-    # Output verbosity options.
-    parser.add_argument("-q", "--quiet", help="set logging to ERROR",
-                        action="store_const", dest="loglevel",
-                        const=logging.ERROR, default=logging.INFO)
-    parser.add_argument("-d", "--debug", help="set logging to DEBUG",
-                        action="store_const", dest="loglevel",
-                        const=logging.DEBUG, default=logging.INFO)
-
-    # JID and password options.
-    parser.add_argument("--jid", dest="jid",
-                        help="JID to use")
-    parser.add_argument("--password", dest="password",
-                        help="password to use")
-    parser.add_argument("--server", dest="server", default='talk.google.com',
-                        help="server to connect to")
-    parser.add_argument("--port", dest="port", default=5222,
-                        help="port to connect to")
-
-
-    args = parser.parse_args()
-
-    # Setup logging.
-    logging.basicConfig(level=args.loglevel, format='%(levelname)-8s %(message)s')
-
-    if args.jid is None:
-        args.jid = input("JID: ")
-    if args.password is None:
-        args.password = getpass("Password: ")
-
     xmppClient = JabberClient(args.jid, args.password, args.server, args.port)
 
-    def SendMessage(ch, method, properties, body):
+    def ReplyToMessageSender(ch, method, properties, body):
         msg = pickle.loads(body)
-
-        xmppClient.send_message(mto=msg.msgTo
-                                     , mbody="Thanks for sending: %s" % msg.msgBody
+        xmppClient.send_message(mto=msg.msgFrom
+                                     , mbody="Thanks for sending: %s on %s" % (msg.msgBody, msg.msgDateTime)
                                      , mtype='chat')
 
-    channel.basic_consume(SendMessage,
-                          queue='SendMessage',
+        channel.basic_publish(exchange='topic_logging',
+                      routing_key='Logging',
+                      body="Message Sent To: %s, From: %s, Action: %s, Body: %s" % (msg.msgFrom
+                                                                                          , msg.msgTo
+                                                                                          , msg.msgAction
+                                                                                          , msg.msgBody))
+
+    channel.basic_consume(ReplyToMessageSender,
+                          queue=send_message_queue_name,
                           no_ack=True)
 
     channel.start_consuming()
